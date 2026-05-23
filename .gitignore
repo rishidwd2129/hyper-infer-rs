@@ -1,0 +1,8 @@
+.cache/
+.cache/huggingface/
+**/.cache/
+target/
+*.lock
+
+.DS_Store
+**/.DS_Store
