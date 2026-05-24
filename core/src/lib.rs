@@ -207,8 +207,24 @@ impl Tensor {
     // 2. Scale scores to keep variance ~1
     let scaled_scores = scores.scale(scale);
     
+    // --- Add Casue Mask Block ---    
+    let seq_len = scaled_scores.shape[0];
+    let mut masked_data = scaled_scores.data.clone();
+
+    for i in 0..seq_len {
+        for j in 0..seq_len {
+            if j > i { // If column > row, it's a "future" token
+                masked_data[i * seq_len + j] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    let masked_scores = Tensor::new(masked_data, vec![seq_len,seq_len]);
+
+    // ----------------------------------
+    
+    // Now Softmax will correctly turn the -INF values into 0.0 probabilities
     // 3. Softmax to get attention weights (row-wise probabilities)
-    let attention_weights = scaled_scores.softmax();  // [seq_len, seq_len]
+    let attention_weights = masked_scores.softmax();  // [seq_len, seq_len]
     
     // 4. Weighted sum of values
     attention_weights.matmul(value)  // [seq_len, d_v]
