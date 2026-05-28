@@ -1,5 +1,8 @@
-// The 'pub' keyword makes this accessible to the CLI and future iOS apps.
 
+
+// The 'pub' keyword makes this accessible to the CLI and future iOS apps.
+pub mod generation;
+pub use generation::{GenerationEngine, Gpt2BlockWeights};
 // Add this line at the top with your other mod declarations
 pub mod profiler;
 
@@ -498,7 +501,7 @@ pub fn gpt2_forward(
     let normed = hidden.layer_norm(ln_f_gamma, ln_f_beta, 1e-5);
 
     // Profiling GPT2 Forward Pass
-    crate::profiler::print_profile_summary();
+    // crate::profiler::print_profile_summary();
 
     normed.matmul(&lm_head_weight.transpose())
 }

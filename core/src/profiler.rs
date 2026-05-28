@@ -63,9 +63,9 @@ impl Drop for ProfileGuard {
         }
         
         // Print if it took more than 1ms (helps spot slow operations)
-        if elapsed > Duration::from_millis(1) {
-            eprintln!("  [FAST] {} took {:.2}ms", self.name, elapsed.as_secs_f64() * 1000.0);
-        }
+        // if elapsed > Duration::from_millis(1) {
+        //     eprintln!("  [FAST] {} took {:.2}ms", self.name, elapsed.as_secs_f64() * 1000.0);
+        // }
     }
 }
 
