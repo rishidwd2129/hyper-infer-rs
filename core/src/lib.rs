@@ -15,6 +15,56 @@ pub struct Tensor {
     pub data: Vec<f32>,
     pub shape: Vec<usize>,
 }
+
+// ============================================================
+// MEMORY ARENA / WORKSPACE STRUCTURES
+// ============================================================
+
+/// Pre-allocated scratch buffers used during a forward pass to eliminate allocations.
+pub struct ComputeWorkspace {
+    pub q_proj: Tensor,
+    pub k_proj: Tensor,
+    pub v_proj: Tensor,
+    pub attn_scores: Tensor,
+    pub attn_output: Tensor,
+    pub ffn_hidden: Tensor,
+    pub ffn_output: Tensor,
+}
+
+impl ComputeWorkspace {
+    /// Allocates the maximum possible memory the model will ever need for one layer.
+    pub fn new(max_seq_len: usize, d_model: usize) -> Self {
+        let max_elements = max_seq_len * d_model;
+        let max_attn_elements = max_seq_len * max_seq_len;
+        let max_ffn_elements = max_seq_len * (d_model * 4); // GPT-2 FFN expands by 4x
+
+        Self {
+            q_proj: Tensor::new(vec![0.0; max_elements], vec![max_seq_len, d_model]),
+            k_proj: Tensor::new(vec![0.0; max_elements], vec![max_seq_len, d_model]),
+            v_proj: Tensor::new(vec![0.0; max_elements], vec![max_seq_len, d_model]),
+            
+            attn_scores: Tensor::new(vec![0.0; max_attn_elements], vec![max_seq_len, max_seq_len]),
+            attn_output: Tensor::new(vec![0.0; max_elements], vec![max_seq_len, d_model]),
+            
+            ffn_hidden: Tensor::new(vec![0.0; max_ffn_elements], vec![max_seq_len, d_model * 4]),
+            ffn_output: Tensor::new(vec![0.0; max_elements], vec![max_seq_len, d_model]),
+        }
+    }
+
+    /// Dynamically resizes the "views" of all buffers for the current sequence length.
+    pub fn resize_for_step(&mut self, current_seq_len: usize, d_model: usize) {
+        self.q_proj.set_view(vec![current_seq_len, d_model]);
+        self.k_proj.set_view(vec![current_seq_len, d_model]);
+        self.v_proj.set_view(vec![current_seq_len, d_model]);
+        
+        self.attn_scores.set_view(vec![current_seq_len, current_seq_len]);
+        self.attn_output.set_view(vec![current_seq_len, d_model]);
+        
+        self.ffn_hidden.set_view(vec![current_seq_len, d_model * 4]);
+        self.ffn_output.set_view(vec![current_seq_len, d_model]);
+    }
+}
+
 impl Tensor {
     // A constructor function to easily create new Tensors
     pub fn new(data: Vec<f32>, shape: Vec<usize>) -> Self {
@@ -319,7 +369,92 @@ pub fn gelu(&self) -> Tensor {
     Tensor::new(out_data, self.shape.clone())
 }
 
+    // ============================================================
+    // ZERO-ALLOCATION OPERATIONS (ARENA PATTERN)
+    // ============================================================
 
+    /// Zero-allocation addition. Writes result directly into the `out` tensor.
+  pub fn add_into(&self, other: &Tensor, out: &mut Tensor) {
+        assert_eq!(self.shape, other.shape, "Shapes must match for addition");
+        assert_eq!(self.shape, out.shape, "Output shape must match input shape");
+
+        // Calculate the actual number of active elements based on the current shape, 
+        // NOT the underlying vector's total maximum capacity.
+        let active_elements: usize = self.shape.iter().product();
+
+        for i in 0..active_elements {
+            out.data[i] = self.data[i] + other.data[i];
+        }
+    }
+
+    /// Zero-allocation matrix multiplication. Writes result directly into the `out` tensor.
+pub fn matmul_into(&self, other: &Tensor, out: &mut Tensor) {
+        let _guard = crate::profiler::ProfileGuard::new("matmul_into");
+
+        assert_eq!(self.shape[1], other.shape[0], "Matrix dimensions do not match");
+        
+        let out_rows = self.shape[0];
+        let out_cols = other.shape[1];
+        let shared_dim = self.shape[1];
+
+        assert_eq!(out.shape, vec![out_rows, out_cols], "Output tensor shape mismatch");
+
+        // IMPORTANT: Because we accumulate (+=) in our matmul loops, 
+        // we MUST zero out the pre-allocated buffer first! Otherwise, 
+        // we will add our new math to the garbage left over from the last token.
+        out.data.fill(0.0);
+
+        let block = 32;
+
+        for i_block in (0..out_rows).step_by(block) {
+            for j_block in (0..out_cols).step_by(block) {
+                for k_block in (0..shared_dim).step_by(block) {
+                    let i_end = (i_block + block).min(out_rows);
+                    let j_end = (j_block + block).min(out_cols);
+                    let k_end = (k_block + block).min(shared_dim);
+
+                    for i in i_block..i_end {
+                        for j in j_block..j_end {
+                            let mut sum = 0.0;
+                            for k in k_block..k_end {
+                                sum += self.get(i, k) * other.get(k, j);
+                            }
+                            let flat_index = i * out_cols + j;
+                            // Accumulate into the pre-allocated memory
+                            out.data[flat_index] += sum;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adjusts the active "view" of the tensor without reallocating memory.
+pub fn set_view(&mut self, new_shape: Vec<usize>) {
+        let required_elements: usize = new_shape.iter().product();
+        assert!(
+            required_elements <= self.data.len(),
+            "Cannot set view: required {} elements, but buffer only holds {}",
+            required_elements, self.data.len()
+        );
+        self.shape = new_shape;
+    }
+
+    /// Zero-allocation, in-place bias addition. Mutates the tensor directly.
+    pub fn add_bias_in_place(&mut self, bias: &Tensor) {
+        assert_eq!(self.shape.len(), 2, "add_bias_in_place expects 2D input");
+        assert_eq!(bias.shape.len(), 1, "add_bias_in_place expects 1D bias");
+        assert_eq!(self.shape[1], bias.shape[0], "Bias dimension must match last dim");
+        
+        let rows = self.shape[0];
+        let cols = self.shape[1];
+        
+        for i in 0..rows {
+            for j in 0..cols {
+                self.data[i * cols + j] += bias.data[j];
+            }
+        }
+    }
 
 }
 
@@ -336,6 +471,7 @@ pub fn gelu(&self) -> Tensor {
 ///   out_weight:  [d_model, d_model]
 ///   out_bias:    [d_model]
 ///   num_heads:   number of attention heads
+/// Upgraded Multi-Head Self-Attention with KV Caching
 pub fn multi_head_attention(
     x: &Tensor,
     q_weight: &Tensor, q_bias: &Tensor,
@@ -343,61 +479,68 @@ pub fn multi_head_attention(
     v_weight: &Tensor, v_bias: &Tensor,
     out_weight: &Tensor, out_bias: &Tensor,
     num_heads: usize,
+    kv_cache: &mut kv_cache::LayerKVCache, // 👈 Added mutable reference to this layer's cache
 ) -> Tensor {
-    let seq_len = x.shape[0];
+    let seq_len = x.shape[0];    // Number of new incoming tokens (1 during decode phase)
     let d_model = x.shape[1];
     let head_dim = d_model / num_heads;
     
     assert_eq!(d_model % num_heads, 0, "d_model must be divisible by num_heads");
     
-    // 1. Linear projections: Q = xW_q + b_q, K = xW_k + b_k, V = xW_v + b_v
+    // 1. Compute linear projections for the NEW incoming tokens only
     let q = x.matmul(q_weight).add_bias(q_bias);  // [seq_len, d_model]
-    let k = x.matmul(k_weight).add_bias(k_bias);
-    let v = x.matmul(v_weight).add_bias(v_bias);
-    
-    // 2. Reshape to separate heads: [seq_len, d_model] → [seq_len, num_heads, head_dim]
-    //    Then we treat each head independently
-    //    For simplicity, reshape to [num_heads, seq_len, head_dim]
-    //    by first going [seq_len, num_heads, head_dim] then "transposing" axes
-    
-    // Step 2a: Reshape to [seq_len, num_heads, head_dim]
-    let _q_3d = q.reshape(vec![seq_len, num_heads, head_dim]);
-    let _k_3d = k.reshape(vec![seq_len, num_heads, head_dim]);
-    let _v_3d = v.reshape(vec![seq_len, num_heads, head_dim]);
-    
-    // Step 2b: Manual head extraction using 2D slices
-    // Since our ops are 2D, we loop over heads and run attention per head
+    let k = x.matmul(k_weight).add_bias(k_bias);  // [seq_len, d_model]
+    let v = x.matmul(v_weight).add_bias(v_bias);  // [seq_len, d_model]
     
     let mut head_outputs: Vec<Tensor> = Vec::new();
     
+    // 2. Loop through each attention head
     for h in 0..num_heads {
-        // Extract head h: Q_h of shape [seq_len, head_dim]
-        let mut q_head_data = vec![0.0; seq_len * head_dim];
-        let mut k_head_data = vec![0.0; seq_len * head_dim];
-        let mut v_head_data = vec![0.0; seq_len * head_dim];
+        // Step 2a: Extract individual head slices for the current tokens,
+        // and push the new Key/Value vectors into our persistent arena.
+        for s in 0..seq_len {
+            let src_offset = s * d_model + h * head_dim;
+            let current_k_vector = &k.data[src_offset..src_offset + head_dim];
+            let current_v_vector = &v.data[src_offset..src_offset + head_dim];
+            
+            // Overwrite into our pre-allocated cache memory arena
+            kv_cache.push_k(h, current_k_vector);
+            kv_cache.push_v(h, current_v_vector);
+        }
+
+        // Step 2b: Pull out the *full history* (past tokens + current tokens) from the cache
+        let full_k_slice = kv_cache.k_slice(h);
+        let full_v_slice = kv_cache.v_slice(h);
         
+        // Total sequence length including all historical context
+        // During generation step 100, total_seq_len will be 100, even though seq_len is 1!
+        let total_seq_len = kv_cache.seq_len() + seq_len; 
+        
+        // Wrap these flat historical slices back into temporary Tensor "views" for math ops
+        let k_historical = Tensor::new(full_k_slice.to_vec(), vec![total_seq_len, head_dim]);
+        let v_historical = Tensor::new(full_v_slice.to_vec(), vec![total_seq_len, head_dim]);
+
+        // Step 2c: Extract the current Query vector for this head
+        let mut q_head_data = vec![0.0; seq_len * head_dim];
         for s in 0..seq_len {
             for d in 0..head_dim {
-                let src_idx = s * d_model + h * head_dim + d;
-                let dst_idx = s * head_dim + d;
-                q_head_data[dst_idx] = q.data[src_idx];
-                k_head_data[dst_idx] = k.data[src_idx];
-                v_head_data[dst_idx] = v.data[src_idx];
+                q_head_data[s * head_dim + d] = q.data[s * d_model + h * head_dim + d];
             }
         }
-        
         let q_head = Tensor::new(q_head_data, vec![seq_len, head_dim]);
-        let k_head = Tensor::new(k_head_data, vec![seq_len, head_dim]);
-        let v_head = Tensor::new(v_head_data, vec![seq_len, head_dim]);
         
-        // Run attention for this head
-        let attn_out = Tensor::scaled_dot_product_attention(&q_head, &k_head, &v_head);
+        // Step 2d: Run attention matching the current Query against ALL historical Keys/Values
+        let attn_out = Tensor::scaled_dot_product_attention(&q_head, &k_historical, &v_historical);
         head_outputs.push(attn_out);
     }
+
+    // 3. Update the cache's master cursor after all heads have processed the incoming tokens
+    for _ in 0..seq_len {
+        kv_cache.increment_seq_len();
+    }
     
-    // 3. Concatenate heads back: [num_heads, seq_len, head_dim] → [seq_len, d_model]
+    // 4. Concatenate heads back: [num_heads, seq_len, head_dim] → [seq_len, d_model]
     let mut concat_data = vec![0.0; seq_len * d_model];
-    
     for s in 0..seq_len {
         for h in 0..num_heads {
             for d in 0..head_dim {
@@ -410,7 +553,7 @@ pub fn multi_head_attention(
     
     let concat = Tensor::new(concat_data, vec![seq_len, d_model]);
     
-    // 4. Output projection
+    // 5. Output projection
     concat.matmul(out_weight).add_bias(out_bias)
 }
 
@@ -476,7 +619,7 @@ pub fn gpt2_forward(
     lm_head_weight: &Tensor,
 ) -> Tensor {
     // Add this for profiling GPT2 forward pass
-    let total_guard = crate::profiler::ProfileGuard::new("gpt2_forward_total");
+    let _total_guard = crate::profiler::ProfileGuard::new("gpt2_forward_total");
 
     let tok_emb = embedding_lookup(wte, token_ids);
     let positions: Vec<usize> = (0..token_ids.len()).collect();
