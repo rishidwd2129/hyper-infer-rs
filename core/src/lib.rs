@@ -5,6 +5,7 @@ pub mod generation;
 pub use generation::{GenerationEngine, Gpt2BlockWeights};
 // Add this line at the top with your other mod declarations
 pub mod profiler;
+pub mod kv_cache; // Import kv_cache module
 
 // Re-export the macros for easy use
 pub use profiler::print_profile_summary;
@@ -247,40 +248,43 @@ impl Tensor {
 }
 
     pub fn scaled_dot_product_attention(query: &Tensor, key: &Tensor, value: &Tensor) -> Tensor {
-    // query:  [seq_len, d_k]   - what we're looking for
-    // key:    [seq_len, d_k]   - what we match against
-    // value:  [seq_len, d_v]   - what we extract
+    // query:  [q_len, head_dim]
+    // key:    [kv_len, head_dim]
+    // value:  [kv_len, head_dim]
     
     let d_k = query.shape[1] as f32;
     let scale = 1.0_f32 / d_k.sqrt();
     
-    // 1. Compute attention scores: Q @ K^T
-    let scores = query.matmul(&key.transpose());  // [seq_len, seq_len]
+    // 1. Compute attention scores: Q @ K^T -> [q_len, kv_len]
+    let scores = query.matmul(&key.transpose());  
     
-    // 2. Scale scores to keep variance ~1
+    // 2. Scale scores
     let scaled_scores = scores.scale(scale);
     
-    // --- Add Casue Mask Block ---    
-    let seq_len = scaled_scores.shape[0];
+    let q_len = scaled_scores.shape[0];
+    let kv_len = scaled_scores.shape[1];
     let mut masked_data = scaled_scores.data.clone();
 
-    for i in 0..seq_len {
-        for j in 0..seq_len {
-            if j > i { // If column > row, it's a "future" token
-                masked_data[i * seq_len + j] = f32::NEG_INFINITY;
+    // 3. Apply Causal Mask safely for non-square matrices
+    // We compute the absolute global position offset to align the query with historical keys
+    let native_offset = kv_len.saturating_sub(q_len);
+
+    for i in 0..q_len {
+        for j in 0..kv_len {
+            // Causal rule: a query token at position (native_offset + i) 
+            // cannot look at a key token at index j if j > (native_offset + i)
+            if j > (native_offset + i) {
+                masked_data[i * kv_len + j] = f32::NEG_INFINITY;
             }
         }
     }
-    let masked_scores = Tensor::new(masked_data, vec![seq_len,seq_len]);
-
-    // ----------------------------------
+    let masked_scores = Tensor::new(masked_data, vec![q_len, kv_len]);
     
-    // Now Softmax will correctly turn the -INF values into 0.0 probabilities
-    // 3. Softmax to get attention weights (row-wise probabilities)
-    let attention_weights = masked_scores.softmax();  // [seq_len, seq_len]
+    // 4. Softmax row-wise
+    let attention_weights = masked_scores.softmax();  // [q_len, kv_len]
     
-    // 4. Weighted sum of values
-    attention_weights.matmul(value)  // [seq_len, d_v]
+    // 5. Weighted sum of values: [q_len, kv_len] @ [kv_len, head_dim] -> [q_len, head_dim]
+    attention_weights.matmul(value)  
 }
 
     pub fn reshape(&self, new_shape: Vec<usize>) -> Tensor {
@@ -472,6 +476,7 @@ pub fn set_view(&mut self, new_shape: Vec<usize>) {
 ///   out_bias:    [d_model]
 ///   num_heads:   number of attention heads
 /// Upgraded Multi-Head Self-Attention with KV Caching
+/// Upgraded Multi-Head Self-Attention with KV Caching
 pub fn multi_head_attention(
     x: &Tensor,
     q_weight: &Tensor, q_bias: &Tensor,
@@ -479,48 +484,51 @@ pub fn multi_head_attention(
     v_weight: &Tensor, v_bias: &Tensor,
     out_weight: &Tensor, out_bias: &Tensor,
     num_heads: usize,
-    kv_cache: &mut kv_cache::LayerKVCache, // 👈 Added mutable reference to this layer's cache
+    kv_cache: &mut crate::kv_cache::LayerKVCache, 
 ) -> Tensor {
-    let seq_len = x.shape[0];    // Number of new incoming tokens (1 during decode phase)
+    let seq_len = x.shape[0];    
     let d_model = x.shape[1];
     let head_dim = d_model / num_heads;
     
     assert_eq!(d_model % num_heads, 0, "d_model must be divisible by num_heads");
     
-    // 1. Compute linear projections for the NEW incoming tokens only
-    let q = x.matmul(q_weight).add_bias(q_bias);  // [seq_len, d_model]
-    let k = x.matmul(k_weight).add_bias(k_bias);  // [seq_len, d_model]
-    let v = x.matmul(v_weight).add_bias(v_bias);  // [seq_len, d_model]
+    let q = x.matmul(q_weight).add_bias(q_bias);  
+    let k = x.matmul(k_weight).add_bias(k_bias);  
+    let v = x.matmul(v_weight).add_bias(v_bias);  
     
-    let mut head_outputs: Vec<Tensor> = Vec::new();
-    
-    // 2. Loop through each attention head
+    // ==========================================
+    // PHASE 1: WRITE TO CACHE
+    // ==========================================
     for h in 0..num_heads {
-        // Step 2a: Extract individual head slices for the current tokens,
-        // and push the new Key/Value vectors into our persistent arena.
         for s in 0..seq_len {
             let src_offset = s * d_model + h * head_dim;
             let current_k_vector = &k.data[src_offset..src_offset + head_dim];
             let current_v_vector = &v.data[src_offset..src_offset + head_dim];
             
-            // Overwrite into our pre-allocated cache memory arena
             kv_cache.push_k(h, current_k_vector);
             kv_cache.push_v(h, current_v_vector);
         }
+    }
 
-        // Step 2b: Pull out the *full history* (past tokens + current tokens) from the cache
+    // Immediately increment the tracker so the slices know about the new tokens
+    for _ in 0..seq_len {
+        kv_cache.increment_seq_len();
+    }
+
+    // ==========================================
+    // PHASE 2: COMPUTE ATTENTION
+    // ==========================================
+    let mut head_outputs: Vec<Tensor> = Vec::new(); // 👈 Initialized OUTSIDE the loop
+    let total_seq_len = kv_cache.seq_len(); // 👈 Accurately reflects all tokens
+    
+    for h in 0..num_heads {
+        // Now when we pull the slice, it includes the token we just pushed
         let full_k_slice = kv_cache.k_slice(h);
         let full_v_slice = kv_cache.v_slice(h);
         
-        // Total sequence length including all historical context
-        // During generation step 100, total_seq_len will be 100, even though seq_len is 1!
-        let total_seq_len = kv_cache.seq_len() + seq_len; 
-        
-        // Wrap these flat historical slices back into temporary Tensor "views" for math ops
         let k_historical = Tensor::new(full_k_slice.to_vec(), vec![total_seq_len, head_dim]);
         let v_historical = Tensor::new(full_v_slice.to_vec(), vec![total_seq_len, head_dim]);
 
-        // Step 2c: Extract the current Query vector for this head
         let mut q_head_data = vec![0.0; seq_len * head_dim];
         for s in 0..seq_len {
             for d in 0..head_dim {
@@ -529,31 +537,25 @@ pub fn multi_head_attention(
         }
         let q_head = Tensor::new(q_head_data, vec![seq_len, head_dim]);
         
-        // Step 2d: Run attention matching the current Query against ALL historical Keys/Values
         let attn_out = Tensor::scaled_dot_product_attention(&q_head, &k_historical, &v_historical);
         head_outputs.push(attn_out);
     }
 
-    // 3. Update the cache's master cursor after all heads have processed the incoming tokens
-    for _ in 0..seq_len {
-        kv_cache.increment_seq_len();
-    }
-    
-    // 4. Concatenate heads back: [num_heads, seq_len, head_dim] → [seq_len, d_model]
+    // ==========================================
+    // PHASE 3: CONCATENATE AND PROJECT
+    // ==========================================
     let mut concat_data = vec![0.0; seq_len * d_model];
     for s in 0..seq_len {
         for h in 0..num_heads {
             for d in 0..head_dim {
                 let src_idx = s * head_dim + d;
                 let dst_idx = s * d_model + h * head_dim + d;
-                concat_data[dst_idx] = head_outputs[h].data[src_idx];
+                concat_data[dst_idx] = head_outputs[h].data[src_idx]; // 👈 head_outputs is safely accessible here
             }
         }
     }
     
     let concat = Tensor::new(concat_data, vec![seq_len, d_model]);
-    
-    // 5. Output projection
     concat.matmul(out_weight).add_bias(out_bias)
 }
 
@@ -573,6 +575,8 @@ pub fn transformer_block(
     ffn_w2: &Tensor, ffn_b2: &Tensor,  // Second linear layer (projection)
     // LayerNorm 2
     ln2_gamma: &Tensor, ln2_beta: &Tensor,
+    // 👈 ADDED: Pass the specific layer's cache down to attention
+    kv_cache: &mut crate::kv_cache::LayerKVCache, 
 ) -> Tensor {
     // Self-Attention with residual
     let normed = x.layer_norm(ln1_gamma, ln1_beta, 1e-5);
@@ -583,6 +587,7 @@ pub fn transformer_block(
         v_weight, v_bias,
         out_weight, out_bias,
         num_heads,
+        kv_cache, // 👈 Hand it to the attention function
     );
     let residual1 = x.add(&attn_out);  // Skip connection
     
@@ -617,16 +622,20 @@ pub fn gpt2_forward(
     ln_f_gamma: &Tensor,
     ln_f_beta: &Tensor,
     lm_head_weight: &Tensor,
+    kv_cache: &mut crate::kv_cache::KVCache, // 👈 ADDED: The master cache for all 12 layers
 ) -> Tensor {
     // Add this for profiling GPT2 forward pass
     let _total_guard = crate::profiler::ProfileGuard::new("gpt2_forward_total");
 
     let tok_emb = embedding_lookup(wte, token_ids);
-    let positions: Vec<usize> = (0..token_ids.len()).collect();
+    // 👈 CRITICAL FIX: Positional Embeddings
+    // If the cache has 5 tokens, and we feed 1 new token, its position index should be 5, not 0!
+    let start_pos = kv_cache.layers[0].seq_len();
+    let positions: Vec<usize> = (start_pos..start_pos + token_ids.len()).collect();
     let pos_emb = embedding_lookup(wpe, &positions);
     let mut hidden = tok_emb.add(&pos_emb);
     
-    for block in blocks {
+    for (i,block) in blocks.iter().enumerate() {
         hidden = transformer_block(
             &hidden,
             &block.0, &block.1,   // q_w, q_b ✅
@@ -638,6 +647,7 @@ pub fn gpt2_forward(
             &block.10, &block.11, // ffn_w1, ffn_b1 ✅
             &block.12, &block.13, // ffn_w2, ffn_b2 ✅
             &block.14, &block.15, // ln2_g, ln2_b ✅
+            &mut kv_cache.layers[i], // 👈 Pass the SPECIFIC cache for this layer
         );
     }
     
