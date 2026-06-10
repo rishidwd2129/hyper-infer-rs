@@ -499,8 +499,8 @@ pub fn multi_head_attention(
     // ==========================================
     // PHASE 1: WRITE TO CACHE
     // ==========================================
-    for h in 0..num_heads {
-        for s in 0..seq_len {
+    for s in 0..seq_len {
+        for h in 0..num_heads {
             let src_offset = s * d_model + h * head_dim;
             let current_k_vector = &k.data[src_offset..src_offset + head_dim];
             let current_v_vector = &v.data[src_offset..src_offset + head_dim];
@@ -508,12 +508,14 @@ pub fn multi_head_attention(
             kv_cache.push_k(h, current_k_vector);
             kv_cache.push_v(h, current_v_vector);
         }
+        // Increment ONCE per token position, after all heads are written
+        kv_cache.increment_seq_len();
     }
 
     // Immediately increment the tracker so the slices know about the new tokens
-    for _ in 0..seq_len {
-        kv_cache.increment_seq_len();
-    }
+    // for _ in 0..seq_len {
+    //     kv_cache.increment_seq_len();
+    // }
 
     // ==========================================
     // PHASE 2: COMPUTE ATTENTION

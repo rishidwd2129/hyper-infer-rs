@@ -54,7 +54,7 @@ fn main() {
     println!("\n========== Running Generation Loop ==========\n");
 
     // 3. Dynamically encode your prompt instead of hardcoding IDs!
-    let prompt = "The cat sat on the mat";
+    let prompt = "Cat sat on mat";
     let encoding = tokenizer.encode(prompt, false).unwrap();
     
     // Convert u32 IDs from the tokenizer into the usize IDs your engine expects
