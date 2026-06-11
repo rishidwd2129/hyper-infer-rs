@@ -47,6 +47,10 @@ impl<'a> GenerationEngine<'a> {
         // 2. ADDED: Initialize the KV Cache for GPT-2 Small
         // 12 layers, 12 heads, head_dim of 64 (768 d_model / 12), and max context of 1024
         let mut kv_cache = KVCache::new(12, 12, 64, 1024);
+        //Updated memory allocator
+        // 👈 Single allocation for the entire generation run
+    // GPT-2 Small: max_seq_len=1024, d_model=768
+        let mut workspace = crate::ComputeWorkspace::new(1024, 768);
 
         // We clone the prompt into our context window to keep track of the full text
         let mut context = prompt_tokens.to_vec();
@@ -62,7 +66,8 @@ impl<'a> GenerationEngine<'a> {
             let logits = gpt2_forward(
                 &input_tokens,
                 self.wte, self.wpe, self.blocks, self.ln_f_gamma, self.ln_f_beta, self.wte,
-                &mut kv_cache // 👈 Pass our new cache into the forward pass!
+                &mut kv_cache, // 👈 Pass our new cache into the forward pass!
+                &mut workspace,
             );
 
             // Extract the logits for the very last token in the sequence we just processed

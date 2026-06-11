@@ -485,6 +485,7 @@ pub fn multi_head_attention(
     out_weight: &Tensor, out_bias: &Tensor,
     num_heads: usize,
     kv_cache: &mut crate::kv_cache::LayerKVCache, 
+    workspace: &mut ComputeWorkspace,  // 👈 passing memory arena
 ) -> Tensor {
     let seq_len = x.shape[0];    
     let d_model = x.shape[1];
@@ -492,9 +493,23 @@ pub fn multi_head_attention(
     
     assert_eq!(d_model % num_heads, 0, "d_model must be divisible by num_heads");
     
-    let q = x.matmul(q_weight).add_bias(q_bias);  
-    let k = x.matmul(k_weight).add_bias(k_bias);  
-    let v = x.matmul(v_weight).add_bias(v_bias);  
+    // let q = x.matmul(q_weight).add_bias(q_bias);  
+    // let k = x.matmul(k_weight).add_bias(k_bias);  
+    // let v = x.matmul(v_weight).add_bias(v_bias);  
+    // ── ZERO-ALLOCATION Q/K/V PROJECTIONS ──
+    // Resize workspace views to match current seq_len before writing into them
+    workspace.q_proj.set_view(vec![seq_len, d_model]);
+    workspace.k_proj.set_view(vec![seq_len, d_model]);
+    workspace.v_proj.set_view(vec![seq_len, d_model]);
+
+    x.matmul_into(q_weight, &mut workspace.q_proj);
+    workspace.q_proj.add_bias_in_place(q_bias);
+
+    x.matmul_into(k_weight, &mut workspace.k_proj);
+    workspace.k_proj.add_bias_in_place(k_bias);
+
+    x.matmul_into(v_weight, &mut workspace.v_proj);
+    workspace.v_proj.add_bias_in_place(v_bias);
     
     // ==========================================
     // PHASE 1: WRITE TO CACHE
@@ -502,8 +517,8 @@ pub fn multi_head_attention(
     for s in 0..seq_len {
         for h in 0..num_heads {
             let src_offset = s * d_model + h * head_dim;
-            let current_k_vector = &k.data[src_offset..src_offset + head_dim];
-            let current_v_vector = &v.data[src_offset..src_offset + head_dim];
+            let current_k_vector = &workspace.k_proj.data[src_offset..src_offset + head_dim];
+            let current_v_vector = &workspace.v_proj.data[src_offset..src_offset + head_dim];
             
             kv_cache.push_k(h, current_k_vector);
             kv_cache.push_v(h, current_v_vector);
@@ -534,7 +549,7 @@ pub fn multi_head_attention(
         let mut q_head_data = vec![0.0; seq_len * head_dim];
         for s in 0..seq_len {
             for d in 0..head_dim {
-                q_head_data[s * head_dim + d] = q.data[s * d_model + h * head_dim + d];
+                q_head_data[s * head_dim + d] = workspace.q_proj.data[s * d_model + h * head_dim + d];
             }
         }
         let q_head = Tensor::new(q_head_data, vec![seq_len, head_dim]);
@@ -579,6 +594,7 @@ pub fn transformer_block(
     ln2_gamma: &Tensor, ln2_beta: &Tensor,
     // 👈 ADDED: Pass the specific layer's cache down to attention
     kv_cache: &mut crate::kv_cache::LayerKVCache, 
+    workspace: &mut ComputeWorkspace,  // 👈 ADDED pre defined Compuet Workspace
 ) -> Tensor {
     // Self-Attention with residual
     let normed = x.layer_norm(ln1_gamma, ln1_beta, 1e-5);
@@ -590,6 +606,7 @@ pub fn transformer_block(
         out_weight, out_bias,
         num_heads,
         kv_cache, // 👈 Hand it to the attention function
+        workspace, // Pre defined Compter workspace tensor
     );
     let residual1 = x.add(&attn_out);  // Skip connection
     
@@ -625,6 +642,7 @@ pub fn gpt2_forward(
     ln_f_beta: &Tensor,
     lm_head_weight: &Tensor,
     kv_cache: &mut crate::kv_cache::KVCache, // 👈 ADDED: The master cache for all 12 layers
+    workspace: &mut ComputeWorkspace,  // 👈 ADDED Pre defined Compute Workspace
 ) -> Tensor {
     // Add this for profiling GPT2 forward pass
     let _total_guard = crate::profiler::ProfileGuard::new("gpt2_forward_total");
@@ -650,6 +668,7 @@ pub fn gpt2_forward(
             &block.12, &block.13, // ffn_w2, ffn_b2 ✅
             &block.14, &block.15, // ln2_g, ln2_b ✅
             &mut kv_cache.layers[i], // 👈 Pass the SPECIFIC cache for this layer
+             workspace,  // 👈 ADDEd Pre defined Compute Workspace
         );
     }
     
