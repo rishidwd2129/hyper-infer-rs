@@ -6,7 +6,7 @@ pub use generation::{GenerationEngine, Gpt2BlockWeights};
 // Add this line at the top with your other mod declarations
 pub mod profiler;
 pub mod kv_cache; // Import kv_cache module
-
+pub mod backend; 
 // Re-export the macros for easy use
 pub use profiler::print_profile_summary;
 
@@ -392,46 +392,64 @@ pub fn gelu(&self) -> Tensor {
     }
 
     /// Zero-allocation matrix multiplication. Writes result directly into the `out` tensor.
+/// Zero-allocation matrix multiplication. Writes result directly into the `out` tensor.
+/// Routes through the compute backend (Scalar/NEON/Metal).
 pub fn matmul_into(&self, other: &Tensor, out: &mut Tensor) {
-        let _guard = crate::profiler::ProfileGuard::new("matmul_into");
+    let _guard = crate::profiler::ProfileGuard::new("matmul_into");
 
-        assert_eq!(self.shape[1], other.shape[0], "Matrix dimensions do not match");
-        
-        let out_rows = self.shape[0];
-        let out_cols = other.shape[1];
-        let shared_dim = self.shape[1];
+    assert_eq!(self.shape[1], other.shape[0], "Matrix dimensions do not match");
 
-        assert_eq!(out.shape, vec![out_rows, out_cols], "Output tensor shape mismatch");
+    let out_rows = self.shape[0];
+    let out_cols = other.shape[1];
+    let shared_dim = self.shape[1];
 
-        // IMPORTANT: Because we accumulate (+=) in our matmul loops, 
-        // we MUST zero out the pre-allocated buffer first! Otherwise, 
-        // we will add our new math to the garbage left over from the last token.
-        out.data.fill(0.0);
+    assert_eq!(
+        out.shape,
+        vec![out_rows, out_cols],
+        "Output tensor shape mismatch"
+    );
 
-        let block = 32;
+    out.data.fill(0.0);
 
-        for i_block in (0..out_rows).step_by(block) {
-            for j_block in (0..out_cols).step_by(block) {
-                for k_block in (0..shared_dim).step_by(block) {
-                    let i_end = (i_block + block).min(out_rows);
-                    let j_end = (j_block + block).min(out_cols);
-                    let k_end = (k_block + block).min(shared_dim);
+    let block = 32;
 
-                    for i in i_block..i_end {
-                        for j in j_block..j_end {
-                            let mut sum = 0.0;
-                            for k in k_block..k_end {
-                                sum += self.get(i, k) * other.get(k, j);
-                            }
-                            let flat_index = i * out_cols + j;
-                            // Accumulate into the pre-allocated memory
-                            out.data[flat_index] += sum;
+    for i_block in (0..out_rows).step_by(block) {
+        for j_block in (0..out_cols).step_by(block) {
+            for k_block in (0..shared_dim).step_by(block) {
+                let i_end = (i_block + block).min(out_rows);
+                let j_end = (j_block + block).min(out_cols);
+                let k_end = (k_block + block).min(shared_dim);
+
+                for i in i_block..i_end {
+                    for j in j_block..j_end {
+                        let mut k = k_block;
+                        let mut sum;
+
+                        // ── NEON SIMD path ──
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            sum = neon_dot(self, other, i, j, k_block, k_end);
+                            k = k_end; // NEON handled all of k including cleanup
                         }
+
+                        #[cfg(not(target_arch = "aarch64"))]
+                        {
+                            sum = 0.0;
+                        }
+
+                        // scalar cleanup for non-aarch64
+                        while k < k_end {
+                            sum += self.get(i, k) * other.get(k, j);
+                            k += 1;
+                        }
+
+                        out.data[i * out_cols + j] += sum;
                     }
                 }
             }
         }
     }
+}
 
     /// Adjusts the active "view" of the tensor without reallocating memory.
 pub fn set_view(&mut self, new_shape: Vec<usize>) {
@@ -461,6 +479,67 @@ pub fn set_view(&mut self, new_shape: Vec<usize>) {
     }
 
 }
+/// NEON-accelerated dot product for one (i, j) output element.
+/// Processes k in chunks of 4 using vfmaq_f32, scalar cleanup for remainder.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn neon_dot_inner(
+    a: &Tensor,
+    b: &Tensor,
+    i: usize,
+    j: usize,
+    k_start: usize,
+    k_end: usize,
+) -> f32 {
+    use std::arch::aarch64::*;
+
+    unsafe{
+    let mut sum_vec = vdupq_n_f32(0.0);
+    let mut k = k_start;
+
+    while k + 4 <= k_end {
+        let a0 = *a.data.get_unchecked(i * a.shape[1] + k);
+        let a1 = *a.data.get_unchecked(i * a.shape[1] + k + 1);
+        let a2 = *a.data.get_unchecked(i * a.shape[1] + k + 2);
+        let a3 = *a.data.get_unchecked(i * a.shape[1] + k + 3);
+        let a_vec = vld1q_f32([a0, a1, a2, a3].as_ptr());
+
+        let b0 = *b.data.get_unchecked(k       * b.shape[1] + j);
+        let b1 = *b.data.get_unchecked((k + 1) * b.shape[1] + j);
+        let b2 = *b.data.get_unchecked((k + 2) * b.shape[1] + j);
+        let b3 = *b.data.get_unchecked((k + 3) * b.shape[1] + j);
+        let b_vec = vld1q_f32([b0, b1, b2, b3].as_ptr());
+
+        sum_vec = vfmaq_f32(sum_vec, a_vec, b_vec);
+        k += 4;
+    }
+    
+
+    // Horizontal reduction
+    let mut sum = vaddvq_f32(sum_vec);
+
+    // Scalar cleanup for remainder
+    while k < k_end {
+        sum += a.data[i * a.shape[1] + k] * b.data[k * b.shape[1] + j];
+        k += 1;
+    }
+
+    sum
+}
+}
+
+/// Safe wrapper — callable from safe Rust inside matmul_into
+#[cfg(target_arch = "aarch64")]
+fn neon_dot(
+    a: &Tensor,
+    b: &Tensor,
+    i: usize,
+    j: usize,
+    k_start: usize,
+    k_end: usize,
+) -> f32 {
+    unsafe { neon_dot_inner(a, b, i, j, k_start, k_end) }
+}
 
 /// Multi-Head Self-Attention
 /// 
@@ -485,7 +564,8 @@ pub fn multi_head_attention(
     out_weight: &Tensor, out_bias: &Tensor,
     num_heads: usize,
     kv_cache: &mut crate::kv_cache::LayerKVCache, 
-    workspace: &mut ComputeWorkspace,  // 👈 passing memory arena
+    workspace: &mut ComputeWorkspace,  
+    backend: &dyn crate::backend::ComputeBackend, // 👈 THE NEW CABLE
 ) -> Tensor {
     let seq_len = x.shape[0];    
     let d_model = x.shape[1];
@@ -493,22 +573,18 @@ pub fn multi_head_attention(
     
     assert_eq!(d_model % num_heads, 0, "d_model must be divisible by num_heads");
     
-    // let q = x.matmul(q_weight).add_bias(q_bias);  
-    // let k = x.matmul(k_weight).add_bias(k_bias);  
-    // let v = x.matmul(v_weight).add_bias(v_bias);  
-    // ── ZERO-ALLOCATION Q/K/V PROJECTIONS ──
-    // Resize workspace views to match current seq_len before writing into them
+    // ── ZERO-ALLOCATION Q/K/V PROJECTIONS VIA BACKEND ──
     workspace.q_proj.set_view(vec![seq_len, d_model]);
     workspace.k_proj.set_view(vec![seq_len, d_model]);
     workspace.v_proj.set_view(vec![seq_len, d_model]);
 
-    x.matmul_into(q_weight, &mut workspace.q_proj);
+    backend.matmul_into(x, q_weight, &mut workspace.q_proj);
     workspace.q_proj.add_bias_in_place(q_bias);
 
-    x.matmul_into(k_weight, &mut workspace.k_proj);
+    backend.matmul_into(x, k_weight, &mut workspace.k_proj);
     workspace.k_proj.add_bias_in_place(k_bias);
 
-    x.matmul_into(v_weight, &mut workspace.v_proj);
+    backend.matmul_into(x, v_weight, &mut workspace.v_proj);
     workspace.v_proj.add_bias_in_place(v_bias);
     
     // ==========================================
@@ -523,23 +599,16 @@ pub fn multi_head_attention(
             kv_cache.push_k(h, current_k_vector);
             kv_cache.push_v(h, current_v_vector);
         }
-        // Increment ONCE per token position, after all heads are written
         kv_cache.increment_seq_len();
     }
-
-    // Immediately increment the tracker so the slices know about the new tokens
-    // for _ in 0..seq_len {
-    //     kv_cache.increment_seq_len();
-    // }
 
     // ==========================================
     // PHASE 2: COMPUTE ATTENTION
     // ==========================================
-    let mut head_outputs: Vec<Tensor> = Vec::new(); // 👈 Initialized OUTSIDE the loop
-    let total_seq_len = kv_cache.seq_len(); // 👈 Accurately reflects all tokens
+    let mut head_outputs: Vec<Tensor> = Vec::new(); 
+    let total_seq_len = kv_cache.seq_len(); 
     
     for h in 0..num_heads {
-        // Now when we pull the slice, it includes the token we just pushed
         let full_k_slice = kv_cache.k_slice(h);
         let full_v_slice = kv_cache.v_slice(h);
         
@@ -567,7 +636,7 @@ pub fn multi_head_attention(
             for d in 0..head_dim {
                 let src_idx = s * head_dim + d;
                 let dst_idx = s * d_model + h * head_dim + d;
-                concat_data[dst_idx] = head_outputs[h].data[src_idx]; // 👈 head_outputs is safely accessible here
+                concat_data[dst_idx] = head_outputs[h].data[src_idx]; 
             }
         }
     }
@@ -595,7 +664,10 @@ pub fn transformer_block(
     // 👈 ADDED: Pass the specific layer's cache down to attention
     kv_cache: &mut crate::kv_cache::LayerKVCache, 
     workspace: &mut ComputeWorkspace,  // 👈 ADDED pre defined Compuet Workspace
+    backend: &dyn crate::backend::ComputeBackend,
 ) -> Tensor {
+    let seq_len = x.shape[0];
+
     // Self-Attention with residual
     let normed = x.layer_norm(ln1_gamma, ln1_beta, 1e-5);
     let attn_out = multi_head_attention(
@@ -607,6 +679,7 @@ pub fn transformer_block(
         num_heads,
         kv_cache, // 👈 Hand it to the attention function
         workspace, // Pre defined Compter workspace tensor
+        backend,
     );
     let residual1 = x.add(&attn_out);  // Skip connection
     
@@ -614,11 +687,18 @@ pub fn transformer_block(
 
     // Feed-Forward Network with residual
     let normed2 = residual1.layer_norm(ln2_gamma, ln2_beta, 1e-5);
-    let ffn_hidden = normed2.matmul(ffn_w1).add_bias(ffn_b1).gelu(); 
-    // Expand + activate
-    let ffn_out = ffn_hidden.matmul(ffn_w2).add_bias(ffn_b2);          // Project back
+    // 👈 3. UPGRADED FFN TO ZERO-ALLOCATION BACKEND MATH
+    workspace.ffn_hidden.set_view(vec![seq_len, ffn_w1.shape[1]]);
+    backend.matmul_into(&normed2, ffn_w1, &mut workspace.ffn_hidden);
+    workspace.ffn_hidden.add_bias_in_place(ffn_b1);
+    
+    let ffn_activated = workspace.ffn_hidden.gelu(); 
 
-    let residual2 = residual1.add(&ffn_out);  // Skip connection
+    workspace.ffn_output.set_view(vec![seq_len, ffn_w2.shape[1]]);
+    backend.matmul_into(&ffn_activated, ffn_w2, &mut workspace.ffn_output);
+    workspace.ffn_output.add_bias_in_place(ffn_b2);
+
+    let residual2 = residual1.add(&workspace.ffn_output);  // Skip connection
     residual2
 }
 
@@ -643,6 +723,7 @@ pub fn gpt2_forward(
     lm_head_weight: &Tensor,
     kv_cache: &mut crate::kv_cache::KVCache, // 👈 ADDED: The master cache for all 12 layers
     workspace: &mut ComputeWorkspace,  // 👈 ADDED Pre defined Compute Workspace
+    backend: &dyn crate::backend::ComputeBackend // 👈🏻 Added to pass the backend
 ) -> Tensor {
     // Add this for profiling GPT2 forward pass
     let _total_guard = crate::profiler::ProfileGuard::new("gpt2_forward_total");
@@ -668,7 +749,8 @@ pub fn gpt2_forward(
             &block.12, &block.13, // ffn_w2, ffn_b2 ✅
             &block.14, &block.15, // ln2_g, ln2_b ✅
             &mut kv_cache.layers[i], // 👈 Pass the SPECIFIC cache for this layer
-             workspace,  // 👈 ADDEd Pre defined Compute Workspace
+            workspace,  // 👈 ADDEd Pre defined Compute Workspace
+            backend, // 👈🏻 Added to pass backend
         );
     }
     

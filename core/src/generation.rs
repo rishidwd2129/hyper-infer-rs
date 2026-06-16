@@ -77,6 +77,7 @@ impl<'a> GenerationEngine<'a> {
                 self.wte, self.wpe, self.blocks, self.ln_f_gamma, self.ln_f_beta, self.wte,
                 &mut kv_cache, // 👈 Pass our new cache into the forward pass!
                 &mut workspace,
+                &*self.backend,
             );
 
             // Extract the logits for the very last token in the sequence we just processed
