@@ -1,5 +1,5 @@
 // src/backend/mod.rs
-
+pub mod metal_setup;
 use crate::Tensor;
 
 pub trait ComputeBackend: Send + Sync {
@@ -100,7 +100,9 @@ impl ComputeBackend for NeonBackend {
 }
 
 // ── Metal backend (stub, wired later) ──
-pub struct MetalBackend;
+pub struct MetalBackend{
+    context: metal_setup::MetalContext,
+}
 
 impl ComputeBackend for MetalBackend {
     fn name(&self) -> &'static str { "metal" }
