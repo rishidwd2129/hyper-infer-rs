@@ -5,6 +5,7 @@ use crate::kv_cache::KVCache;
 use rand::Rng;
 use rand::RngExt;
 
+
 // Define a type alias for the massive 16-tuple layer block weights 
 // to avoid repeating this long signature across your functions.
 pub type Gpt2BlockWeights = (
@@ -18,6 +19,7 @@ pub struct GenerationEngine<'a> {
     blocks: &'a [(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)],
     ln_f_gamma: &'a Tensor,
     ln_f_beta: &'a Tensor,
+    backend: Box<dyn crate::backend::ComputeBackend>,  // 👈 ADDED for SIMD instructions
 }
 
 impl<'a> GenerationEngine<'a> {
@@ -28,8 +30,15 @@ impl<'a> GenerationEngine<'a> {
         blocks: &'a [(Gpt2BlockWeights)],
         ln_f_gamma: &'a Tensor,
         ln_f_beta: &'a Tensor,
+        
     ) -> Self {
-        Self { wte, wpe, blocks, ln_f_gamma, ln_f_beta }
+        Self { wte,
+            wpe,
+            blocks,
+            ln_f_gamma,
+            ln_f_beta,
+         backend: crate::backend::select_backend(),  // 👈 ADDED: detected once, reused forever
+          }
     }
 
     pub fn generate_stream<F>(
@@ -68,6 +77,7 @@ impl<'a> GenerationEngine<'a> {
                 self.wte, self.wpe, self.blocks, self.ln_f_gamma, self.ln_f_beta, self.wte,
                 &mut kv_cache, // 👈 Pass our new cache into the forward pass!
                 &mut workspace,
+                &*self.backend,
             );
 
             // Extract the logits for the very last token in the sequence we just processed
