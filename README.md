@@ -96,7 +96,7 @@ for correct offset.
 
 **Root cause:** Every Q/K/V projection in `multi_head_attention` allocated a
 new `Vec<f32>` — 3 allocations × 12 layers × every token step = 1,080
-unnecessary heap requests per generation run.
+unnecessary heap requests per generation run
 
 **Fix:** `ComputeWorkspace` struct pre-allocates maximum-size scratch buffers
 at startup (`q_proj`, `k_proj`, `v_proj`, `attn_scores`, `attn_output`,
