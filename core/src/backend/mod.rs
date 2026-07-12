@@ -1,5 +1,5 @@
 // src/backend/mod.rs
-
+pub mod metal_setup;
 use crate::Tensor;
 
 pub trait ComputeBackend: Send + Sync {
@@ -99,22 +99,50 @@ impl ComputeBackend for NeonBackend {
     }
 }
 
-// ── Metal backend (stub, wired later) ──
-pub struct MetalBackend;
+// ── Metal backend (Now holding the GPU dispatcher!) ──
+pub struct MetalBackend {
+    // We hold the context so we only compile the shader ONCE at startup
+    context: metal_setup::MetalContext,
+}
+
+impl MetalBackend {
+    pub fn new() -> Self {
+        Self { context: metal_setup::MetalContext::new() }
+    }
+}
 
 impl ComputeBackend for MetalBackend {
     fn name(&self) -> &'static str { "metal" }
+    
     fn matmul_into(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) {
-        NeonBackend.matmul_into(a, b, out)
+        let _guard = crate::profiler::ProfileGuard::new("matmul_into_metal");
+        
+        // 1. Extract the dimensions for the GPU grid
+        // A is [M, K], B is [K, N], Output is [M, N]
+        let m = a.shape[0];
+        let k = a.shape[1];
+        let n = b.shape[1];
+        
+        // 2. Fire the GPU dispatcher!
+        // This takes the flat data arrays and sends them to the Unified Memory buffers
+        let result = self.context.dispatch_matmul(&a.data, &b.data, m, n, k);
+        // THE FIX: Slice the output buffer to exactly match the active elements (m * n)
+        // before copying the GPU results over.
+        let active_elements = m * n;
+        // 3. Copy the GPU result directly into our zero-allocation workspace buffer
+        out.data[..active_elements].copy_from_slice(&result);
     }
 }
 
 // ── Detection: called once at startup ──
+// ── Update the Detection to actually select Metal ──
 pub fn select_backend() -> Box<dyn ComputeBackend> {
     #[cfg(target_arch = "aarch64")]
     {
-        println!("Backend: NEON (aarch64 detected)");
-        return Box::new(NeonBackend);
+        // For right now, let's force the engine to select METAL instead of NEON
+        // so we can actually test our new GPU code!
+        println!("Backend: METAL (Apple GPU detected)");
+        return Box::new(MetalBackend::new()); 
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
